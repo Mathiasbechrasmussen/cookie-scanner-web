@@ -125,7 +125,7 @@ app.post('/api/scan', async (req, res) => {
 
 // ⬇️ Catch-all fallback for frontend i Express 5 (ingen path — undgår path-to-regexp)
 app.use((_req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  res.sendFile(path.join(__dirname, 'index.html'));
 });
 
 // Start server
