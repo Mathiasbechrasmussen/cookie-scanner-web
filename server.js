@@ -1,4 +1,4 @@
-// server.js — Cookie Scanner Web (Express 5 + Playwright, Render-ready)
+// server.js — Cookie Scanner Web (Express 5 + Playwright; tolerant body parsing; Render-ready)
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -8,17 +8,16 @@ const { chromium } = require('playwright');
 const app = express();
 
 /* ──────────────────────────────────────────────────────────────
-   Statisk frontend (public/ hvis findes, ellers rodmappen)
+   Statisk frontend
    ────────────────────────────────────────────────────────────── */
 const PUBLIC_DIR = path.join(__dirname, 'public');
-if (fs.existsSync(PUBLIC_DIR)) app.use(express.static(PUBLIC_DIR));
-else app.use(express.static(__dirname));
+app.use(express.static(fs.existsSync(PUBLIC_DIR) ? PUBLIC_DIR : __dirname));
 
 /* ──────────────────────────────────────────────────────────────
-   CORS + preflight
+   CORS + explicit preflight
    ────────────────────────────────────────────────────────────── */
-app.use(cors());                       // svarer med Access-Control-Allow-Origin: *
-app.options('/api/scan', cors());      // eksplicit preflight OK for POST /api/scan
+app.use(cors());
+app.options('/api/scan', cors());
 
 /* ──────────────────────────────────────────────────────────────
    Indstillinger
@@ -36,9 +35,7 @@ const CONSENT_SELECTORS = [
   'button[title="Accept all"]',
   'button[title="Accept All"]',
   '.ot-sdk-container .accept-btn-handler',
-  'button#acceptAll',
-  'button#cmpbntyestxt',
-  'button#cmpwelcomebtnyes'
+  'button#acceptAll', 'button#cmpbntyestxt', 'button#cmpwelcomebtnyes'
 ];
 
 /* ──────────────────────────────────────────────────────────────
@@ -54,8 +51,7 @@ async function capture(context, url, stage){
     const dom = (c.domain||'').replace(/^\./,'');
     const firstParty = dom ? (host === dom || host.endsWith(`.${dom}`)) : true;
     return {
-      url, stage,
-      name:c.name, domain:c.domain, path:c.path,
+      url, stage, name:c.name, domain:c.domain, path:c.path,
       secure:!!c.secure, httpOnly:!!c.httpOnly, sameSite:c.sameSite||'',
       expires_iso: toIso(c.expires), firstParty
     };
@@ -81,7 +77,6 @@ async function scanUrl(targetUrl){
     headless: true,
     args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage']
   });
-
   try{
     const context = await browser.newContext({ viewport:{ width:1280, height:900 } });
     const page = await context.newPage();
@@ -112,32 +107,65 @@ async function scanUrl(targetUrl){
    Routes
    ────────────────────────────────────────────────────────────── */
 
-// Health check (Render → Settings → Health Check Path: /healthz)
+// Health check
 app.get('/healthz', (_req, res) => res.json({ ok:true }));
 
-// API: brug JSON-parser **kun** her (undgår raw-body fejl på OPTIONS)
-app.post('/api/scan', express.json({ limit:'200kb' }), async (req, res) => {
-  try{
-    const { url } = req.body || {};
-    if (!url) return res.status(400).json({ error:'Manglende url' });
+// TOLERANT BODY PARSING her (accepter JSON, tekst, form-encoded)
+// Vi lægger parseren PÅ ruten for at undgå konflikter med OPTIONS mm.
+app.post(
+  '/api/scan',
+  // accepter alle content-types som tekst (så raw-body ikke fejler), max 1 MB
+  express.text({ type: '*/*', limit: '1mb' }),
+  async (req, res) => {
+    try {
+      let url;
 
-    let parsed;
-    try{
-      parsed = new URL(url);
-      if (!/^https?:$/.test(parsed.protocol)) throw new Error('Bad protocol');
-    }catch{
-      return res.status(400).json({ error:'Ugyldig URL. Husk https://...' });
+      // 1) Prøv JSON
+      if (req.headers['content-type'] && req.headers['content-type'].includes('application/json')) {
+        try {
+          const j = JSON.parse(req.body || '{}');
+          url = j.url;
+        } catch (e) {
+          console.error('JSON parse error:', e?.message);
+        }
+      }
+
+      // 2) Hvis ikke, prøv form-encoded
+      if (!url) {
+        try {
+          const params = new URLSearchParams(req.body || '');
+          if (params.has('url')) url = params.get('url');
+        } catch {}
+      }
+
+      // 3) Sidste udvej: query param ?url=
+      if (!url && req.query && req.query.url) url = String(req.query.url);
+
+      if (!url) {
+        return res.status(400).json({
+          error: 'Manglende url / kunne ikke læse request body',
+          hint: 'Send JSON: {"url":"https://eksempel.dk/"} med Content-Type: application/json'
+        });
+      }
+
+      let parsed;
+      try{
+        parsed = new URL(url);
+        if (!/^https?:$/.test(parsed.protocol)) throw new Error('Bad protocol');
+      }catch{
+        return res.status(400).json({ error:'Ugyldig URL. Husk https://...' });
+      }
+
+      const result = await scanUrl(parsed.href);
+      res.json(result);
+    } catch (err) {
+      console.error('Scan error:', err?.stack || err?.message || err);
+      res.status(500).json({ error:'Scanning fejlede', detail:String(err?.message || err) });
     }
-
-    const result = await scanUrl(parsed.href);
-    res.json(result);
-  }catch(err){
-    console.error('Scan error:', err && (err.stack || err.message || err));
-    res.status(500).json({ error:'Scanning fejlede', detail:String(err && (err.message || err)) });
   }
-});
+);
 
-// Catch-all til frontend (Express 5)
+// Catch-all til frontend
 app.use((_req, res) => {
   const indexInPublic = path.join(__dirname, 'public', 'index.html');
   const indexInRoot   = path.join(__dirname, 'index.html');
@@ -145,7 +173,7 @@ app.use((_req, res) => {
 });
 
 /* ──────────────────────────────────────────────────────────────
-   Start server (hosted)
+   Start server
    ────────────────────────────────────────────────────────────── */
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = '0.0.0.0';
